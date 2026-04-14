@@ -1,4 +1,5 @@
 data/*
 !data/mix_datasets.py
 results/
+results_*
 __pycache__/

@@ -56,13 +56,13 @@ class ResNet(nn.Module):
         )
 
         # 自适应池化到固定长度，兼容不同输入序列长度（如 600/700/800/900/1000）
-        self.adaptive_pool = nn.AdaptiveAvgPool1d(15)
+        self.adaptive_pool = nn.AdaptiveAvgPool1d(1)
 
         # 全连接层
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(0.5),  # 较高丢弃率防止过拟合
-            nn.Linear(256 * 15, 512),  # 全连接层
+            nn.Linear(256, 512),  # AdaptiveAvgPool1d(1) 后为 (B,256,1) -> 256 维
             nn.SiLU(),
             nn.Linear(512, 128),
             nn.SiLU(),
@@ -77,7 +77,7 @@ class ResNet(nn.Module):
         x = self.conv3(x)  # (batch_size, 256, 63)
         x = self.conv4(x)  # (batch_size, 256, 32)
         x = self.conv5(x)
-        x = self.adaptive_pool(x)  # (batch_size, 256, 15)
+        x = self.adaptive_pool(x)  # (batch_size, 256, 1)
         x = self.classifier(x)  # (batch_size,)
         return x
 
