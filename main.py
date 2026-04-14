@@ -307,8 +307,8 @@ if not save_dir.exists():
     save_dir.mkdir(parents=True, exist_ok=True)
 
 if mode == 'train':
-    train_dataset_name = ['train_mix_40w.mat']  # train_500_20w + train_1000_20w 混合
-    val_dataset_name = ['dev_mix_32k.mat']  # dev_500_1.6w + dev_1000_1.6w 混合
+    train_dataset_name = ['train_mix_60w.mat']  # train_500~1000 各 10w 混合
+    val_dataset_name = ['dev_mix_24k.mat']  # dev_500~1000 各 4k 混合
     train_model = None  # save_dir / 'fold1' / 'model_epoch59.pth'  # todo 指定训练模型保存路径
     epoch_resume = 0  # todo
 
@@ -380,9 +380,9 @@ if mode == 'train':
 
 if mode == 'test':
     data_type = 'fake'  # todo  fake or real
-    test_dataset_name = 'dev_mix_32k.mat'
+    test_dataset_name = 'dev_mix_24k.mat'
     # 'test_dataset_T2_HP_better_range_v2' 'real_data_control' 'real_data_sci' 'test_dataset_T1_HP_better_range_10'
-    model_file = save_dir / 'fold0'  # todo 指定模型文件或文件夹；单文件如 fold0/model_epoch099.pth 只测该 checkpoint
+    model_file = save_dir / 'fold0' / 'model_epoch099.pth'
     if model_file.is_dir():
         test_dir = model_file
     else:
