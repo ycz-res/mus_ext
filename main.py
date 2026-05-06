@@ -37,7 +37,14 @@ n_fold = 4  # todo
 batch_size = 256  # todo
 num_workers = 0
 num_epochs = 100  # todo
-mode = 'train'  # train test visual
+mode = 'test'  # train test visual
+train_dataset_name = ['split/900_10w_train.mat']
+val_dataset_name = ['split/900_10w_val.mat']
+# 除去 500（6h–1k）各抽 1/5 混合；混合 .mat 与总 manifest 均在 data/xl_mix_sets/ 下
+test_dataset_name = 'xl_mix_sets/mix_no900_test.mat'
+savedir = 'res_900'  # test：从 results/<savedir>/... 加载权重与 label_norm
+test_outdir = 'test_no900'  # test：测试结果保存到 results/<test_outdir>/
+
 model_select = 'ResCNN'  # fixed: only ResNet is used
 loss_type = 'MSELoss'  # todo MSELoss CrossEntropy
 use_label_norm = True  # True：仅对 MSELoss 在训练集上 fit 标准化标签，验证/测试用同一 mean/std
@@ -46,6 +53,18 @@ F16 = False  # todo
 device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 max_mu = 160  # todo 最大MU值
 min_mu = 5  # todo 最小MU值
+
+
+def compute_steprx_d50(prediction, gold, eps=1e-6):
+    """
+    steprx: 相对误差均方根 RMSRE = sqrt(mean(((pred - gold) / gold)^2))，与 MRE 互补。
+    d50: 绝对误差的 50% 分位数（中位绝对误差）。
+    """
+    g = np.maximum(np.asarray(gold, dtype=np.float64), eps)
+    rel = (np.asarray(prediction, dtype=np.float64) - g) / g
+    steprx = float(np.sqrt(np.mean(rel ** 2)))
+    d50 = float(np.percentile(np.abs(prediction - gold), 50))
+    return steprx, d50
 
 
 ## 定义
@@ -238,16 +257,21 @@ def test(model, loader, model_path, test_excel, label_norm_stats=None):
 
     MAE = abs(prediction - gold).mean()
     MRE = (abs(prediction - gold) / gold).mean()
-    print(f'Test: MAE {MAE}, MRE {MRE}')
+    steprx, d50 = compute_steprx_d50(prediction, gold)
+    print(f'Test: MAE {MAE}, MRE {MRE}, steprx {steprx}, d50 {d50}')
     xl_out = np.stack((gold, prediction, abs(prediction - gold), noise, amp, thr, thr_var, hp), axis=-1)
     wb = xl.Workbook()
     ws = wb.active
-    ws.append(['No', 'gold', 'prediction', 'error', 'noise', 'amp', 'thr', 'thr_var', 'hp', 'MAE', 'MRE'])
+    ws.append(
+        ['No', 'gold', 'prediction', 'error', 'noise', 'amp', 'thr', 'thr_var', 'hp', 'MAE', 'MRE', 'steprx', 'd50']
+    )
     [ws.append([k] + tmp.tolist()) for k, tmp in enumerate(xl_out)]
     ws.cell(2, 10).value = MAE
     ws.cell(2, 11).value = MRE
+    ws.cell(2, 12).value = steprx
+    ws.cell(2, 13).value = d50
     wb.save(str(test_excel))
-    return xl_out, MAE, MRE
+    return xl_out, MAE, MRE, steprx, d50
 
 
 def test_real_data(model, loader, model_path, test_dir_, label_norm_stats=None):
@@ -283,32 +307,33 @@ def test_real_data(model, loader, model_path, test_dir_, label_norm_stats=None):
 
     MAE = abs(prediction - gold).mean()
     MRE = (abs(prediction - gold) / gold).mean()
-    print(f'Test: MAE {MAE}, MRE {MRE}')
+    steprx, d50 = compute_steprx_d50(prediction, gold)
+    print(f'Test: MAE {MAE}, MRE {MRE}, steprx {steprx}, d50 {d50}')
     xl_out = np.stack((gold, prediction, abs(prediction - gold)), axis=-1)
     wb = xl.Workbook()
     ws = wb.active
-    ws.append(['gold', 'prediction', 'error', 'MAE', 'MRE'])
+    ws.append(['gold', 'prediction', 'error', 'MAE', 'MRE', 'steprx', 'd50'])
     [ws.append(tmp.tolist()) for tmp in xl_out]
-    ws.cell(2, 6).value = MAE
-    ws.cell(2, 6).value = MRE
+    ws.cell(2, 4).value = MAE
+    ws.cell(2, 5).value = MRE
+    ws.cell(2, 6).value = steprx
+    ws.cell(2, 7).value = d50
     if test_dir_.is_dir():
         wb.save(str(test_dir_ / 'test.xlsx'))
     else:
         wb.save(str(test_dir_))
-    return xl_out, MAE, MRE
+    return xl_out, MAE, MRE, steprx, d50
 
 
 ## load data
 Exp_name = 'ResCNN_test'  # todo 指定实验名称
 assert model_select in Exp_name
 root_dir = Path("./").resolve()
-save_dir = root_dir / 'results' / 'MUNE_simple' / Exp_name
+save_dir = root_dir / 'results' / savedir / Exp_name
 if not save_dir.exists():
     save_dir.mkdir(parents=True, exist_ok=True)
 
 if mode == 'train':
-    train_dataset_name = ['train_mix_60w.mat']  # train_500~1000 各 10w 混合
-    val_dataset_name = ['dev_mix_24k.mat']  # dev_500~1000 各 4k 混合
     train_model = None  # save_dir / 'fold1' / 'model_epoch59.pth'  # todo 指定训练模型保存路径
     epoch_resume = 0  # todo
 
@@ -380,15 +405,10 @@ if mode == 'train':
 
 if mode == 'test':
     data_type = 'fake'  # todo  fake or real
-    test_dataset_name = 'dev_mix_24k.mat'
     # 'test_dataset_T2_HP_better_range_v2' 'real_data_control' 'real_data_sci' 'test_dataset_T1_HP_better_range_10'
     model_file = save_dir / 'fold0' / 'model_epoch099.pth'
-    if model_file.is_dir():
-        test_dir = model_file
-    else:
-        test_dir = model_file.parent
-    test_dir = test_dir / 'test_results'  # todo 指定测试结果保存路径
-    test_dir.mkdir(exist_ok=True)
+    test_dir = root_dir / 'results' / savedir / test_outdir
+    test_dir.mkdir(parents=True, exist_ok=True)
     if model_file.is_dir():
         # 按照epoch排序
         model_file = list(model_file.glob('*.pth'))
@@ -468,24 +488,24 @@ if mode == 'test':
             test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True,
                                      num_workers=num_workers, pin_memory=True)
     # 模型测试
-    test_loss_list = np.zeros((len(model_file), 3))
+    test_loss_list = np.zeros((len(model_file), 5))
     for i, model_file_i in enumerate(model_file):
         epoch_test = re.search(r'_epoch(\d+)\.pth$', str(model_file_i))
         epoch_test = epoch_test.group(1)
         test_excel_i = test_dir / ('epoch_' + epoch_test + '.xlsx')
         model_i = ResNet(input_size=x_dim, num_class=n_class).to(device)
         if data_type == 'real':  # 真实数据测试
-            test_res, test_MAE, test_MRE = test_real_data(
+            test_res, test_MAE, test_MRE, test_steprx, test_d50 = test_real_data(
                 model_i, test_loader, str(model_file_i), test_excel_i, label_norm_stats=label_norm_test
             )
         else:  # 仿真数据测试
-            test_res, test_MAE, test_MRE = test(
+            test_res, test_MAE, test_MRE, test_steprx, test_d50 = test(
                 model_i, test_loader, str(model_file_i), test_excel_i, label_norm_stats=label_norm_test
             )
-        test_loss_list[i] = np.array([int(epoch_test), test_MAE, test_MRE])
+        test_loss_list[i] = np.array([int(epoch_test), test_MAE, test_MRE, test_steprx, test_d50])
     workbook_ = xl.Workbook()
     worksheet_ = workbook_.active
-    worksheet_.append(['epoch', 'test_MAE', 'test_MRE'])
+    worksheet_.append(['epoch', 'test_MAE', 'test_MRE', 'test_steprx', 'test_d50'])
     [worksheet_.append(tmp.tolist()) for tmp in test_loss_list]
     workbook_.save(str(test_dir / 'test_results.xlsx'))
 
