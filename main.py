@@ -37,13 +37,13 @@ n_fold = 4  # todo
 batch_size = 256  # todo
 num_workers = 0
 num_epochs = 100  # todo
-mode = 'test'  # train test visual
-train_dataset_name = ['split/900_10w_train.mat']
-val_dataset_name = ['split/900_10w_val.mat']
+mode = 'test_seg'  # train test test_seg visual
+train_dataset_name = ['split/500_10w_train.mat']
+val_dataset_name = ['split/500_10w_val.mat']
 # 除去 500（6h–1k）各抽 1/5 混合；混合 .mat 与总 manifest 均在 data/xl_mix_sets/ 下
-test_dataset_name = 'xl_mix_sets/mix_no900_test.mat'
-savedir = 'res_900'  # test：从 results/<savedir>/... 加载权重与 label_norm
-test_outdir = 'test_no900'  # test：测试结果保存到 results/<test_outdir>/
+test_dataset_name = 'split/500_10w_test.mat'
+savedir = 'res_500'  # test：从 results/<savedir>/... 加载权重与 label_norm
+test_outdir = 'test_seg'  # test/test_seg：测试结果保存到 results/<test_outdir>/
 
 model_select = 'ResCNN'  # fixed: only ResNet is used
 loss_type = 'MSELoss'  # todo MSELoss CrossEntropy
@@ -274,6 +274,361 @@ def test(model, loader, model_path, test_excel, label_norm_stats=None):
     return xl_out, MAE, MRE, steprx, d50
 
 
+
+def _format_model_output(out, label_norm_stats=None):
+    """将模型输出转成 numpy prediction，保持与 test()/test_real_data() 一致。"""
+    if loss_type == 'CrossEntropy':
+        predicted = torch.argmax(out, dim=1).detach().cpu().numpy()
+    else:
+        if label_norm_stats is not None:
+            predicted = out.detach().squeeze().cpu().numpy()
+        else:
+            predicted = torch.round(out.data).squeeze().cpu().numpy()
+    return np.atleast_1d(predicted)
+
+
+def _finalize_prediction_metrics(prediction_list, gold_list, label_norm_stats=None):
+    """拼接、反标准化、reverse_label、clip，并计算 MAE/MRE/steprx/d50。"""
+    prediction = np.concatenate(prediction_list, axis=-1)
+    gold = np.concatenate(gold_list, axis=-1)
+
+    if label_norm_stats is not None and loss_type != 'CrossEntropy':
+        mean, std = label_norm_stats
+        prediction = inverse_label_standardize(prediction, mean, std)
+        gold = inverse_label_standardize(gold, mean, std)
+        prediction = np.round(prediction)
+        gold = np.round(gold)
+
+    prediction = reverse_label(prediction, trans_flag)
+    gold = reverse_label(gold, trans_flag)
+    prediction[prediction > max_mu] = max_mu
+    prediction[prediction < min_mu] = min_mu
+
+    MAE = float(abs(prediction - gold).mean())
+    MRE = float((abs(prediction - gold) / gold).mean())
+    steprx, d50 = compute_steprx_d50(prediction, gold)
+    return prediction, gold, MAE, MRE, steprx, d50
+
+
+def _run_eval_pass(model, loader, label_norm_stats=None, mask_range=None):
+    """
+    跑一遍测试集。
+    mask_range=None 表示 baseline；否则 mask_range=(start, end)，对输入最后一维 L 做置零。
+    兼容 fake loader 的 7 元组和 real loader 的 2 元组。
+    """
+    prediction, gold = [], []
+    model.eval()
+    for batch in loader:
+        x_t, y_t = batch[0], batch[1]
+        if mask_range is not None:
+            start, end = mask_range
+            x_in = x_t.clone()
+            # x_in shape: (B, C, L)，刺激点位置在最后一维 L。
+            cur_l = x_in.shape[-1]
+            start_i = max(0, min(int(start), cur_l))
+            end_i = max(0, min(int(end), cur_l))
+            if start_i < end_i:
+                x_in[:, :, start_i:end_i] = 0
+        else:
+            x_in = x_t
+
+        with torch.no_grad():
+            out = model(x_in.to(device))
+        predicted = _format_model_output(out, label_norm_stats=label_norm_stats)
+        prediction.append(predicted)
+        gold.append(np.atleast_1d(y_t.cpu().numpy()))
+
+    return _finalize_prediction_metrics(prediction, gold, label_norm_stats=label_norm_stats)
+
+
+def _infer_loader_max_len(loader):
+    """推断当前测试 loader 中输入序列最后一维的最大长度。"""
+    max_l = 0
+    for batch in loader:
+        x_t = batch[0]
+        max_l = max(max_l, int(x_t.shape[-1]))
+    if max_l <= 0:
+        raise ValueError('无法从 test loader 推断输入长度，请检查数据。')
+    return max_l
+
+
+def _save_detail_xlsx(detail_excel, sheet_name, header, rows):
+    """
+    保存样本级明细到 xlsx。
+    注意：当样本数很大、segment 很多时，xlsx 会比较大，但便于直接查看和论文整理。
+    """
+    detail_excel = Path(detail_excel)
+    detail_excel.parent.mkdir(parents=True, exist_ok=True)
+
+    wb = xl.Workbook()
+    ws = wb.active
+    ws.title = sheet_name
+    ws.append(header)
+
+    for row in rows:
+        ws.append(row)
+
+    wb.save(str(detail_excel))
+
+
+def test_seg_effect(
+        model,
+        loader,
+        model_path,
+        test_excel,
+        label_norm_stats=None,
+        segment_size=50,
+        max_len=None,
+        top_k=5,
+        save_detail=True,
+):
+    """
+    测试阶段刺激段影响实验：正常训练好的模型不变，只在 test 时逐段 mask 输入。
+
+    目的：找到模型最适配/最依赖的刺激点段。
+    - 默认 max_len=None：分析当前测试输入的完整长度，例如 500->10段，1000->20段。
+    - 若 max_len=500：只分析共同前500维，适合跨维度共同区域对比。
+    - 输入 x 的形状应为 (B, C, L)，mask 发生在最后一维 L 上。
+
+    输出文件：
+    1) epoch_XXX.xlsx
+       - baseline
+       - seg_effect
+       - top_by_delta_MAE
+    2) epoch_XXX_seg_delta.npy
+       - shape=(num_segments, 4)
+       - columns=[delta_MAE, delta_MRE, delta_steprx, delta_d50]
+    3) epoch_XXX_seg_delta.xlsx
+       - seg_delta 的 Excel 表格版
+    4) epoch_XXX_seg_metrics.npy
+       - shape=(num_segments, 4)
+       - columns=[mask_MAE, mask_MRE, mask_steprx, mask_d50]
+    5) epoch_XXX_seg_metrics.xlsx
+       - seg_metrics 的 Excel 表格版
+    6) epoch_XXX_baseline_detail.xlsx
+       - baseline 每个样本的 gold / prediction / error
+    7) epoch_XXX_seg_detail.xlsx
+       - 每个 segment mask 后，每个样本的 gold / prediction / error
+    """
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    if segment_size <= 0:
+        raise ValueError(f'segment_size 必须为正数，当前为 {segment_size}')
+
+    input_max_len = _infer_loader_max_len(loader)
+    analysis_len = input_max_len if max_len is None else min(int(max_len), input_max_len)
+    num_segments = int(np.ceil(analysis_len / segment_size))
+    test_excel = Path(test_excel)
+    test_excel.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1) baseline：完整输入测试
+    baseline_pred, baseline_gold, base_MAE, base_MRE, base_steprx, base_d50 = _run_eval_pass(
+        model, loader, label_norm_stats=label_norm_stats, mask_range=None
+    )
+
+    baseline_error = np.abs(baseline_pred - baseline_gold)
+
+    print(
+        f'Baseline: MAE {base_MAE}, MRE {base_MRE}, '
+        f'steprx {base_steprx}, d50 {base_d50}, input_len {input_max_len}, analysis_len {analysis_len}'
+    )
+
+    # baseline 样本级明细
+    baseline_detail_rows = []
+    for sample_i in range(len(baseline_gold)):
+        baseline_detail_rows.append([
+            sample_i,
+            float(baseline_gold[sample_i]),
+            float(baseline_pred[sample_i]),
+            float(baseline_error[sample_i]),
+        ])
+
+    # 2) 逐段 mask，计算每个刺激段的误差增量，并保存每个样本的预测结果
+    rows = []
+    detail_rows = []
+    delta_array = np.zeros((num_segments, 4), dtype=np.float64)
+    metric_array = np.zeros((num_segments, 4), dtype=np.float64)
+
+    for seg_i in range(num_segments):
+        start = seg_i * segment_size
+        end = min((seg_i + 1) * segment_size, analysis_len)
+
+        seg_pred, seg_gold, MAE_i, MRE_i, steprx_i, d50_i = _run_eval_pass(
+            model, loader, label_norm_stats=label_norm_stats, mask_range=(start, end)
+        )
+
+        seg_error = np.abs(seg_pred - seg_gold)
+
+        d_MAE = MAE_i - base_MAE
+        d_MRE = MRE_i - base_MRE
+        d_steprx = steprx_i - base_steprx
+        d_d50 = d50_i - base_d50
+
+        metric_array[seg_i] = np.array([MAE_i, MRE_i, steprx_i, d50_i])
+        delta_array[seg_i] = np.array([d_MAE, d_MRE, d_steprx, d_d50])
+
+        rows.append([
+            seg_i,
+            f'S{seg_i + 1}',
+            start,
+            end - 1,
+            MAE_i,
+            MRE_i,
+            steprx_i,
+            d50_i,
+            d_MAE,
+            d_MRE,
+            d_steprx,
+            d_d50,
+        ])
+
+        # segment 样本级明细
+        for sample_i in range(len(seg_gold)):
+            detail_rows.append([
+                seg_i,
+                f'S{seg_i + 1}',
+                start,
+                end - 1,
+                sample_i,
+                float(seg_gold[sample_i]),
+                float(seg_pred[sample_i]),
+                float(seg_error[sample_i]),
+            ])
+
+        print(
+            f'Segment {seg_i} [{start}:{end}): '
+            f'ΔMAE={d_MAE:.6f}, ΔMRE={d_MRE:.6f}, '
+            f'Δsteprx={d_steprx:.6f}, Δd50={d_d50:.6f}'
+        )
+
+    # 3) 保存 npy，便于后续画热力图/跨维度汇总
+    delta_npy = test_excel.with_name(test_excel.stem + '_seg_delta.npy')
+    metrics_npy = test_excel.with_name(test_excel.stem + '_seg_metrics.npy')
+    np.save(delta_npy, delta_array)
+    np.save(metrics_npy, metric_array)
+
+    # 额外保存 npy 对应的 Excel 表格版，便于直接查看和汇总
+    delta_excel = test_excel.with_name(test_excel.stem + '_seg_delta.xlsx')
+    wb_delta = xl.Workbook()
+    ws_delta = wb_delta.active
+    ws_delta.title = 'seg_delta'
+    ws_delta.append([
+        'segment_index',
+        'segment_name',
+        'start',
+        'end',
+        'delta_MAE',
+        'delta_MRE',
+        'delta_steprx',
+        'delta_d50'
+    ])
+    for seg_i in range(num_segments):
+        start = seg_i * segment_size
+        end = min((seg_i + 1) * segment_size, analysis_len)
+        ws_delta.append([
+            seg_i,
+            f'S{seg_i + 1}',
+            start,
+            end - 1,
+            float(delta_array[seg_i, 0]),
+            float(delta_array[seg_i, 1]),
+            float(delta_array[seg_i, 2]),
+            float(delta_array[seg_i, 3]),
+        ])
+    wb_delta.save(str(delta_excel))
+
+    metrics_excel = test_excel.with_name(test_excel.stem + '_seg_metrics.xlsx')
+    wb_metrics = xl.Workbook()
+    ws_metrics = wb_metrics.active
+    ws_metrics.title = 'seg_metrics'
+    ws_metrics.append([
+        'segment_index',
+        'segment_name',
+        'start',
+        'end',
+        'mask_MAE',
+        'mask_MRE',
+        'mask_steprx',
+        'mask_d50'
+    ])
+    for seg_i in range(num_segments):
+        start = seg_i * segment_size
+        end = min((seg_i + 1) * segment_size, analysis_len)
+        ws_metrics.append([
+            seg_i,
+            f'S{seg_i + 1}',
+            start,
+            end - 1,
+            float(metric_array[seg_i, 0]),
+            float(metric_array[seg_i, 1]),
+            float(metric_array[seg_i, 2]),
+            float(metric_array[seg_i, 3]),
+        ])
+    wb_metrics.save(str(metrics_excel))
+
+    # 4) 保存样本级明细 xlsx
+    baseline_detail_excel = test_excel.with_name(test_excel.stem + '_baseline_detail.xlsx')
+    seg_detail_excel = test_excel.with_name(test_excel.stem + '_seg_detail.xlsx')
+
+    if save_detail:
+        _save_detail_xlsx(
+            baseline_detail_excel,
+            'baseline_detail',
+            ['No', 'gold', 'prediction', 'error'],
+            baseline_detail_rows
+        )
+
+        _save_detail_xlsx(
+            seg_detail_excel,
+            'seg_detail',
+            ['segment_index', 'segment_name', 'start', 'end', 'No', 'gold', 'prediction', 'error'],
+            detail_rows
+        )
+
+    # 5) 保存主 Excel：baseline + 全部分段结果 + TopK
+    wb = xl.Workbook()
+
+    ws_base = wb.active
+    ws_base.title = 'baseline'
+    ws_base.append(['input_len', 'analysis_len', 'segment_size', 'MAE', 'MRE', 'steprx', 'd50'])
+    ws_base.append([input_max_len, analysis_len, segment_size, base_MAE, base_MRE, base_steprx, base_d50])
+
+    ws = wb.create_sheet('seg_effect')
+    ws.append([
+        'segment_index', 'segment_name', 'start', 'end',
+        'mask_MAE', 'mask_MRE', 'mask_steprx', 'mask_d50',
+        'delta_MAE', 'delta_MRE', 'delta_steprx', 'delta_d50'
+    ])
+    for row in rows:
+        ws.append(row)
+
+    ws_top = wb.create_sheet('top_by_delta_MAE')
+    ws_top.append([
+        'rank', 'segment_index', 'segment_name', 'start', 'end',
+        'delta_MAE', 'delta_MRE', 'delta_steprx', 'delta_d50'
+    ])
+
+    order = np.argsort(-delta_array[:, 0])
+    for rank, idx in enumerate(order[:min(top_k, len(order))], start=1):
+        row = rows[int(idx)]
+        ws_top.append([rank, row[0], row[1], row[2], row[3], row[8], row[9], row[10], row[11]])
+
+    wb.save(str(test_excel))
+
+    print(f'[TestSeg] saved excel: {test_excel}')
+    print(f'[TestSeg] saved delta npy: {delta_npy}')
+    print(f'[TestSeg] saved delta excel: {delta_excel}')
+    print(f'[TestSeg] saved metrics npy: {metrics_npy}')
+    print(f'[TestSeg] saved metrics excel: {metrics_excel}')
+    if save_detail:
+        print(f'[TestSeg] saved baseline detail excel: {baseline_detail_excel}')
+        print(f'[TestSeg] saved segment detail excel: {seg_detail_excel}')
+
+    # 返回 baseline 预测结果，以及 baseline 和消融结果，兼容后续主流程记录 baseline 指标。
+    xl_out = np.stack((baseline_gold, baseline_pred, baseline_error), axis=-1)
+    return xl_out, base_MAE, base_MRE, base_steprx, base_d50, delta_array, metric_array
+
 def test_real_data(model, loader, model_path, test_dir_, label_norm_stats=None):
     model.load_state_dict(torch.load(model_path))
     prediction, gold = [], []
@@ -403,7 +758,7 @@ if mode == 'train':
         # 训练
         train(model_i, train_loader, val_loader, kf_dir, epoch_resume, label_norm_stats=label_norm_stats)
 
-if mode == 'test':
+if mode in ['test', 'test_seg']:
     data_type = 'fake'  # todo  fake or real
     # 'test_dataset_T2_HP_better_range_v2' 'real_data_control' 'real_data_sci' 'test_dataset_T1_HP_better_range_10'
     model_file = save_dir / 'fold0' / 'model_epoch099.pth'
@@ -494,7 +849,21 @@ if mode == 'test':
         epoch_test = epoch_test.group(1)
         test_excel_i = test_dir / ('epoch_' + epoch_test + '.xlsx')
         model_i = ResNet(input_size=x_dim, num_class=n_class).to(device)
-        if data_type == 'real':  # 真实数据测试
+        if mode == 'test_seg':
+            # 完整长度刺激段影响测试：默认 max_len=None，会分析当前输入的完整长度。
+            # 若只想比较所有维度共同的前500维，可改成 max_len=500。
+            test_res, test_MAE, test_MRE, test_steprx, test_d50, _, _ = test_seg_effect(
+                model_i,
+                test_loader,
+                str(model_file_i),
+                test_excel_i,
+                label_norm_stats=label_norm_test,
+                segment_size=50,
+                max_len=None,
+                top_k=5,
+                save_detail=True,
+            )
+        elif data_type == 'real':  # 真实数据测试
             test_res, test_MAE, test_MRE, test_steprx, test_d50 = test_real_data(
                 model_i, test_loader, str(model_file_i), test_excel_i, label_norm_stats=label_norm_test
             )
