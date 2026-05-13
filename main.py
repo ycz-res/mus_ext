@@ -37,12 +37,12 @@ n_fold = 4  # todo
 batch_size = 256  # todo
 num_workers = 0
 num_epochs = 100  # todo
-mode = 'test_seg'  # train test test_seg visual
-train_dataset_name = ['split/500_10w_train.mat']
-val_dataset_name = ['split/500_10w_val.mat']
+mode = 'test'  # train test test_seg visual（已切到 500_70w 时先用 train 产出 results/res_500_70w）
+train_dataset_name = ['split_70w/500_70w_train.mat']
+val_dataset_name = ['split_70w/500_70w_val.mat']
 # 除去 500（6h–1k）各抽 1/5 混合；混合 .mat 与总 manifest 均在 data/xl_mix_sets/ 下
-test_dataset_name = 'split/500_10w_test.mat'
-savedir = 'res_500'  # test：从 results/<savedir>/... 加载权重与 label_norm
+test_dataset_name = 'split_70w/500_70w_test.mat'
+savedir = 'res_500_70w'  # test：从 results/<savedir>/... 加载权重与 label_norm
 test_outdir = 'test_seg'  # test/test_seg：测试结果保存到 results/<test_outdir>/
 
 model_select = 'ResCNN'  # fixed: only ResNet is used
