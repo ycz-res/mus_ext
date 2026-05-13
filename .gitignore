@@ -1,5 +1,16 @@
-data/*
-!data/mix_datasets.py
+# data/: 跟踪根目录下所有 .py 与子目录结构；子目录内数据文件不入库
+data/data_10w/**
+!data/data_10w/.gitkeep
+data/data_70w/**
+!data/data_70w/.gitkeep
+data/split_10w/**
+!data/split_10w/.gitkeep
+data/split_70w/**
+!data/split_70w/.gitkeep
+data/xl_mix_sets/**
+!data/xl_mix_sets/.gitkeep
+data/__pycache__/
+
 results/
 results_*
 __pycache__/
