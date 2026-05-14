@@ -1,15 +1,21 @@
 """
-将单个 HDF5 .mat 数据集按样本维切分为 train/val/test。
+将 HDF5 .mat 按样本维切分为 train/val/test（默认 8:1:1）。
 
-默认比例 8:1:1，输出：
-  xxx_train.mat
-  xxx_val.mat
-  xxx_test.mat
+统一默认（可用 ``--input-dir`` / ``--output-dir`` 覆盖）：
+  仅写文件名时在 ``data/data_70w`` 下查找；输出到 ``data/split_70w``。
 
-兼容本仓库常见字段：
-  - data: (2, L, N)    -> 样本轴通常是 2
-  - label_num: (1, N)  -> 样本轴通常是 1
-  - seq_len: (1, N)    -> 样本轴通常是 1
+命令行：运行时**只传入要切分的所有 .mat**（一个或多个路径或文件名，可省略 ``.mat``）。
+默认输出到 ``data/split_70w``；仅写文件名时在 ``--input-dir``（默认 ``data/data_70w``）下查找。
+
+示例（在仓库根目录）::
+
+    python3 data/split_dataset.py 500_70w 600_70w 800_70w
+    python3 data/split_dataset.py data/data_70w/500_70w.mat data/data_70w/600_70w.mat
+    python3 data/split_dataset.py data/data_70w/*.mat
+
+若输出目录中已有同名 ``*_train/_val/_test.mat`` 则跳过（``--force`` 重切）。
+
+兼容字段：data (2,L,N)、label_num (1,N)、seq_len (1,N) 等。
 """
 
 from __future__ import annotations
@@ -19,6 +25,10 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+
+# 仓库内 70w 数据的统一默认路径（相对当前工作目录）
+DEFAULT_INPUT_DIR = Path("data/data_70w")
+DEFAULT_OUTPUT_DIR = Path("data/split_70w")
 
 
 def _label_to_1d(label_arr: np.ndarray) -> np.ndarray:
@@ -35,7 +45,6 @@ def _infer_sample_count(data: dict[str, np.ndarray]) -> int:
             raise ValueError("label_num 为空，无法推断样本数。")
         return n
 
-    # 回退策略：使用最大维度作为样本数（仅在无 label_num 时使用）
     max_dim = 0
     for v in data.values():
         if np.asarray(v).ndim > 0:
@@ -63,7 +72,6 @@ def _split_indices(n: int, train_ratio: float, val_ratio: float, test_ratio: flo
 
     n_train = int(round(n * train_ratio))
     n_val = int(round(n * val_ratio))
-    # 保证总数精确为 n
     if n_train + n_val > n:
         n_val = n - n_train
     n_test = n - n_train - n_val
@@ -84,7 +92,6 @@ def _build_split(data: dict[str, np.ndarray], n_samples: int, idx: np.ndarray) -
         arr = np.asarray(arr)
         axis = _infer_sample_axis(arr, n_samples)
         if axis is None:
-            # 对无法识别样本轴的字段，原样拷贝
             out[key] = arr
         else:
             out[key] = _slice_by_indices(arr, axis, idx)
@@ -96,6 +103,56 @@ def _save_mat(path: Path, data: dict[str, np.ndarray]) -> None:
     with h5py.File(path, "w") as f:
         for k, v in data.items():
             f.create_dataset(k, data=v)
+
+
+def _resolve_output_dir(input_path: Path, output_dir: Path | None) -> Path:
+    """未指定 output_dir 时：输入在 data_70w 则写到 data/split_70w，否则与输入同目录。"""
+    input_path = input_path.resolve()
+    if output_dir is not None:
+        return output_dir.resolve()
+    parent = input_path.parent.resolve()
+    if parent.name == "data_70w":
+        return (parent.parent / "split_70w").resolve()
+    return parent
+
+
+def _split_artifacts_exist(out_dir: Path, stem: str) -> bool:
+    out_dir = out_dir.resolve()
+    return all((out_dir / f"{stem}{suffix}").is_file() for suffix in ("_train.mat", "_val.mat", "_test.mat"))
+
+
+def resolve_input_paths(names: list[str], input_dir: Path) -> list[Path]:
+    """将若干路径或文件名解析为存在的 .mat（先字面路径，再在 input_dir 下按文件名查找）。"""
+    input_dir = input_dir.resolve()
+    paths: list[Path] = []
+    for s in names:
+        raw = Path(s).expanduser()
+        tried: list[Path] = []
+
+        p1 = raw.resolve()
+        tried.append(p1)
+        if p1.is_file() and p1.suffix.lower() == ".mat":
+            paths.append(p1)
+            continue
+
+        if raw.suffix.lower() != ".mat":
+            p2 = raw.with_suffix(".mat").resolve()
+            tried.append(p2)
+            if p2.is_file():
+                paths.append(p2)
+                continue
+
+        fname = Path(s.strip()).name
+        if not fname.lower().endswith(".mat"):
+            fname = Path(fname).stem + ".mat"
+        p3 = (input_dir / fname).resolve()
+        tried.append(p3)
+        if p3.is_file():
+            paths.append(p3)
+            continue
+
+        raise FileNotFoundError(f"找不到输入 .mat: {s!r}，已尝试: {tried}")
+    return paths
 
 
 def split_mat_file(
@@ -125,7 +182,7 @@ def split_mat_file(
     test_data = _build_split(loaded, n_samples, test_idx)
 
     stem = input_path.stem
-    out_dir = (output_dir if output_dir is not None else input_path.parent).resolve()
+    out_dir = _resolve_output_dir(input_path, output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     train_path = out_dir / f"{stem}_train.mat"
     val_path = out_dir / f"{stem}_val.mat"
@@ -151,13 +208,13 @@ def split_all_mat_files_in_dir(
     test_ratio: float = 0.1,
     seed: int = 42,
     output_dir: Path | None = None,
+    skip_existing: bool = True,
 ) -> None:
     data_dir = data_dir.resolve()
     if not data_dir.exists() or not data_dir.is_dir():
         raise NotADirectoryError(f"目录不存在或不是目录: {data_dir}")
 
     mat_files = sorted(data_dir.glob("*.mat"))
-    # 避免把已经切分过的文件再次切分
     mat_files = [
         p
         for p in mat_files
@@ -167,9 +224,15 @@ def split_all_mat_files_in_dir(
         print(f"目录 {data_dir} 下没有可切分的 .mat 文件。")
         return
 
-    print(f"发现 {len(mat_files)} 个 .mat 文件，开始按 8:1:1 切分...")
+    out_base = output_dir.resolve() if output_dir is not None else None
+    print(f"发现 {len(mat_files)} 个 .mat 文件，输出目录: {out_base or '（按输入推断）'}")
     for p in mat_files:
         print("-" * 60)
+        out_dir = _resolve_output_dir(p, output_dir)
+        stem = p.stem
+        if skip_existing and _split_artifacts_exist(out_dir, stem):
+            print(f"跳过（train/val/test 已存在）: {p.name} -> {out_dir}")
+            continue
         split_mat_file(
             p,
             train_ratio=train_ratio,
@@ -181,43 +244,58 @@ def split_all_mat_files_in_dir(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="将 .mat 按 8:1:1 切分为 train/val/test。")
-    parser.add_argument("input", nargs="?", default=None, help="输入 .mat 文件路径，例如 data/xxx.mat")
-    parser.add_argument("--all-in-dir", default=None, help="批量切分目录下所有 .mat，例如 data")
+    parser = argparse.ArgumentParser(
+        description="将 .mat 按 8:1:1 切分；运行时传入要切分的所有文件即可，默认输出到 data/split_70w。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="示例:\n  %(prog)s 500_70w 600_70w 800_70w\n  %(prog)s data/data_70w/500_70w.mat data/data_70w/600_70w.mat\n  %(prog)s data/data_70w/*.mat",
+    )
+    parser.add_argument(
+        "files",
+        nargs="+",
+        metavar="FILE",
+        help="要切分的一个或多个 .mat（路径或文件名，可省略 .mat；仅文件名时在 --input-dir 下查找）",
+    )
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        default=DEFAULT_INPUT_DIR,
+        help=f"仅文件名时从此目录查找（默认: {DEFAULT_INPUT_DIR}）",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"train/val/test 输出目录（默认: {DEFAULT_OUTPUT_DIR}）",
+    )
     parser.add_argument("--train-ratio", type=float, default=0.8, help="训练集比例，默认 0.8")
     parser.add_argument("--val-ratio", type=float, default=0.1, help="验证集比例，默认 0.1")
     parser.add_argument("--test-ratio", type=float, default=0.1, help="测试集比例，默认 0.1")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，默认 42")
     parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="train/val/test .mat 输出目录；默认与输入文件同目录",
+        "--force",
+        action="store_true",
+        help="目标目录已有同名 train/val/test 时仍重新切分",
     )
     args = parser.parse_args()
 
-    if args.all_in_dir is not None:
-        split_all_mat_files_in_dir(
-            Path(args.all_in_dir),
+    in_dir = args.input_dir.resolve()
+    out_dir = args.output_dir.resolve()
+
+    paths = resolve_input_paths(args.files, in_dir)
+    for p in paths:
+        print("-" * 60)
+        stem = p.stem
+        if not args.force and _split_artifacts_exist(out_dir, stem):
+            print(f"跳过（train/val/test 已存在）: {p.name} -> {out_dir}")
+            continue
+        split_mat_file(
+            p,
             train_ratio=args.train_ratio,
             val_ratio=args.val_ratio,
             test_ratio=args.test_ratio,
             seed=args.seed,
-            output_dir=args.output_dir,
+            output_dir=out_dir,
         )
-        return
-
-    if args.input is None:
-        parser.error("请提供 input 文件，或使用 --all-in-dir 批量处理目录。")
-
-    split_mat_file(
-        Path(args.input),
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
-        test_ratio=args.test_ratio,
-        seed=args.seed,
-        output_dir=args.output_dir,
-    )
 
 
 if __name__ == "__main__":
