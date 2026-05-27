@@ -1,19 +1,16 @@
 """
-合并多个 HDF5 .mat（与 tools.load_data 布局一致）。
+多份 HDF5 .mat（与 tools.load_data 一致：data / label_num，可选其它键）合并为一份。
 
-「混合」只做一件事：**按 --inputs 顺序做样本组装**——先第 1 个文件里的全部样本，
-再第 2 个文件……例如 500 长的文件里是样本 1,2,3，1000 长的文件里是 4,5,6，合并后样本顺序为
-1,2,3,4,5,6；其中 **1–3 仍是 500 个时间步**，**4–6 仍是 1000 个时间步**（不是把两条波形沿时间拼成一条）。
+流程（仅此一种）：
+  1. 对每个输入文件：**按四舍五入后的整数 MU 分层抽样**，每个 MU 取
+     ``min(该 MU 条数, max(1, round(该 MU 条数 * --fraction)))``；
+  2. **按 --inputs 顺序**把各文件样本沿样本维拼接，不同序列长 L 写入 ``seq_len``，``data`` 为 ``(2, max_L, N)``；
+  3. 对合并结果 **shuffle**（``--seed``），再写出 ``--output``。
 
-实现上 `data` 存为 `(2, max_L, N)`，`max_L` 为各文件有效长度（经 `--max-seq-len` 截断后）的最大值；
-较短样本只占列的前 `seq_len[i]` 个时间步，列尾未用位置为 0（仅存储占位，语义见 `seq_len`）。
-另存 **`seq_len`**，形状 `(1, N)`，每个样本的真实长度，供 `tools.load_data` 使用。
+例如各档 ``*_70w.mat`` 每 MU 5000 条、``--fraction 0.2``、6 个文件：每文件每 MU 1000 条，
+合并后每 MU 约 6000 条，总样本约 ``156 * 6000``。
 
-合并完成后可对**样本顺序**做打乱（`--order shuffle`，CLI 默认）；`data`、`label_num`、`seq_len`
-等同索引一起重排。
-
-约定:
-  - data: (2, max_L, N)，label_num: (1, N)，seq_len: (1, N) 每个样本有效长度 L
+依赖：h5py、numpy。
 """
 
 from __future__ import annotations
@@ -52,14 +49,59 @@ def _pick_concat_axis(arrays: list[np.ndarray]) -> int:
     return next(iter(diff_axes))
 
 
+def _infer_sample_axis_for_n(arr: np.ndarray, n_samples: int) -> int | None:
+    candidates = [i for i, s in enumerate(arr.shape) if int(s) == n_samples]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def subsample_mat_dict_per_mu(
+    data: dict[str, np.ndarray],
+    fraction: float,
+    seed: int,
+) -> dict[str, np.ndarray]:
+    """单文件：按整数 MU 分层抽样；每 MU 取 min(条数, max(1, round(条数 * fraction)))。"""
+    if not (0.0 < fraction <= 1.0):
+        raise ValueError(f"fraction 须在 (0, 1]，当前为 {fraction}")
+
+    arr_data = np.asarray(data["data"], dtype=np.float32)
+    if arr_data.ndim != 3 or arr_data.shape[0] != 2:
+        raise ValueError(f"data 期望 (2, L, N)，当前 {arr_data.shape}")
+    n = int(arr_data.shape[2])
+    y = _label_to_1d(data["label_num"])
+    if y.size != n:
+        raise ValueError(f"label 样本数 {y.size} 与 data 的 N={n} 不一致")
+
+    yi = np.rint(y.astype(np.float64)).astype(np.int64)
+    rng = np.random.default_rng(seed)
+    picked_parts: list[np.ndarray] = []
+    for mu in np.unique(yi):
+        idx_all = np.flatnonzero(yi == mu)
+        c = int(idx_all.size)
+        n_take = max(1, int(round(c * fraction)))
+        n_take = min(n_take, c)
+        perm = rng.permutation(c)[:n_take]
+        picked_parts.append(idx_all[perm])
+    idx = np.concatenate(picked_parts)
+    rng.shuffle(idx)
+
+    out: dict[str, np.ndarray] = {}
+    for key, arr in data.items():
+        arr = np.asarray(arr)
+        axis = _infer_sample_axis_for_n(arr, n)
+        if axis is None:
+            out[key] = arr
+        else:
+            out[key] = np.take(arr, idx, axis=axis)
+    return out
+
+
 def merge_concat_samples(
     loaded: list[dict[str, np.ndarray]],
     max_seq_len: int | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, int]]:
-    """
-    单纯样本组装：按文件顺序沿样本维拼接。各文件 L 可不同；按列写入 (2, max_L, N)，
-    不将短序列用零「拉长」到长序列长度（仅矩阵列尾未用位置为 0），并写入 seq_len。
-    """
+    """按文件顺序沿样本维拼接；各文件 L 可不同，写入 seq_len，data 为 (2, max_L, N)。"""
     keys = set(loaded[0].keys())
     for d in loaded[1:]:
         keys &= set(d.keys())
@@ -140,77 +182,6 @@ def merge_concat_samples(
     return merged, axis_by_key
 
 
-def _concat_label_num(arrays: list[np.ndarray]) -> tuple[np.ndarray, int]:
-    pieces: list[np.ndarray] = []
-    for a in arrays:
-        a = np.asarray(a, dtype=np.float32)
-        if a.ndim == 1:
-            a = a.reshape(1, -1)
-        elif a.ndim == 2:
-            a = a[0:1, :] if a.shape[0] >= 1 else a
-        else:
-            raise ValueError(f"label_num 无法解析: {a.shape}")
-        pieces.append(a)
-    return np.concatenate(pieces, axis=1), 1
-
-
-def merge_mat_files_auto(
-    loaded: list[dict[str, np.ndarray]],
-) -> tuple[dict[str, np.ndarray], dict[str, int]]:
-    common_keys = set(loaded[0].keys())
-    for d in loaded[1:]:
-        common_keys &= set(d.keys())
-    if not common_keys:
-        raise ValueError("No common keys found across input files.")
-
-    merged: dict[str, np.ndarray] = {}
-    axis_by_key: dict[str, int] = {}
-
-    for key in sorted(common_keys):
-        arrays = [d[key] for d in loaded]
-        if key == "label_num":
-            merged[key], axis_by_key[key] = _concat_label_num(arrays)
-            print(
-                f"[{key}] concat sample axis=1, "
-                f"shapes={[np.asarray(a).shape for a in arrays]} -> {merged[key].shape}"
-            )
-            continue
-        axis = _pick_concat_axis(arrays)
-        axis_by_key[key] = axis
-        merged[key] = np.concatenate(arrays, axis=axis)
-        print(
-            f"[{key}] concat axis={axis}, "
-            f"shapes={[np.asarray(a).shape for a in arrays]} -> {merged[key].shape}"
-        )
-
-    return merged, axis_by_key
-
-
-def merge_mat_files(
-    input_paths: list[str | Path],
-    output_path: str | Path,
-    strategy: str = "mix",
-    max_seq_len: int | None = None,
-) -> tuple[dict[str, np.ndarray], dict[str, int]]:
-    files = [Path(p).resolve() for p in input_paths]
-    if len(files) < 2:
-        raise ValueError("至少需要 2 个输入文件。")
-    for fp in files:
-        if not fp.exists():
-            raise FileNotFoundError(f"Input file not found: {fp}")
-
-    loaded: list[dict[str, np.ndarray]] = []
-    for fp in files:
-        with h5py.File(fp, "r") as f:
-            loaded.append({k: np.array(f[k]) for k in f.keys()})
-
-    if strategy in ("mix", "concat_samples", "stack_samples", "train", "pad_samples"):
-        return merge_concat_samples(loaded, max_seq_len=max_seq_len)
-    if strategy == "auto":
-        return merge_mat_files_auto(loaded)
-    raise ValueError(f"Unknown strategy: {strategy}")
-
-
 def _print_shapes(tag: str, merged: dict, axis_by_key: dict) -> None:
     for key in sorted(merged.keys()):
         print(
@@ -219,43 +190,27 @@ def _print_shapes(tag: str, merged: dict, axis_by_key: dict) -> None:
         )
 
 
-def reorder_merged(
+def shuffle_merged(
     merged: dict[str, np.ndarray],
     axis_by_key: dict[str, int],
-    order_mode: str,
-    seed: int | None = None,
+    seed: int | None,
 ) -> dict[str, np.ndarray]:
-    if order_mode == "none":
-        return merged
-
+    """沿样本维随机打乱；各键样本维长度一致的一并重排。"""
     ref_key = "label_num" if "label_num" in merged else next(iter(merged.keys()))
     ref_axis = axis_by_key[ref_key]
     n_samples = merged[ref_key].shape[ref_axis]
+    rng = np.random.default_rng(seed)
+    indices = rng.permutation(n_samples)
+    print(f"\nShuffle: seed={seed}, n_samples={n_samples}")
 
-    if order_mode == "shuffle":
-        rng = np.random.default_rng(seed)
-        indices = rng.permutation(n_samples)
-        print(f"\nReorder: shuffle, seed={seed}, n_samples={n_samples}")
-    elif order_mode == "sort":
-        if "label_num" not in merged:
-            print("\nReorder: sort skipped (no label_num key).")
-            return merged
-        lab = merged["label_num"]
-        ax = axis_by_key["label_num"]
-        labels = np.take(lab, np.arange(lab.shape[ax]), axis=ax).reshape(-1)
-        indices = np.argsort(labels, kind="stable")
-        print("\nReorder: sort by label_num (ascending).")
-    else:
-        raise ValueError(f"Unknown order mode: {order_mode}")
-
-    reordered: dict[str, np.ndarray] = {}
+    out: dict[str, np.ndarray] = {}
     for key, value in merged.items():
         axis = axis_by_key[key]
         if value.shape[axis] == n_samples:
-            reordered[key] = np.take(value, indices, axis=axis)
+            out[key] = np.take(value, indices, axis=axis)
         else:
-            reordered[key] = value
-    return reordered
+            out[key] = value
+    return out
 
 
 def save_merged(merged: dict[str, np.ndarray], output_path: Path) -> None:
@@ -270,59 +225,66 @@ def save_merged(merged: dict[str, np.ndarray], output_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="按文件顺序拼接样本；各文件 L 可不同，写入 seq_len 表示每条样本真实长度。",
+        description="多 .mat：每文件按整数 MU 取比例 → 拼接混合 → shuffle 写出（seq_len 变长）。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例（先 500 长度集全部样本，再 1000 长度集全部样本；约 40w 条）:
-  python3 data/mix_datasets.py --inputs data/train_500_20w.mat data/train_1000_20w.mat \\
-    --output data/train_mix_40w.mat --max-seq-len 1000 --order shuffle --seed 42
-
-验证集（约 3.2w 条）:
-  python3 data/mix_datasets.py --inputs data/dev_500_1.6w.mat data/dev_1000_1.6w.mat \\
-    --output data/dev_mix_32k.mat --max-seq-len 1000 --order shuffle --seed 42
+示例（六档 70w，每文件每 MU 取 1/5，再混合；约 156*6000 条）:
+  python3 data/mix_datasets.py \\
+    --inputs data/data_70w/500_70w.mat data/data_70w/600_70w.mat data/data_70w/700_70w.mat \\
+            data/data_70w/800_70w.mat data/data_70w/900_70w.mat data/data_70w/1000_70w.mat \\
+    --output data/mix_70w_f0p2.mat --fraction 0.2 --max-seq-len 1000 --seed 42
 """,
     )
     parser.add_argument(
         "--inputs",
         nargs="+",
         required=True,
-        help="按顺序列出 .mat；样本顺序为先第 1 个文件，再第 2 个……",
+        help="按顺序列出输入 .mat（至少 2 个）",
     )
     parser.add_argument("--output", required=True, help="输出 .mat")
     parser.add_argument(
-        "--order",
-        choices=["shuffle", "sort", "none"],
-        default="shuffle",
-        help="合并后是否打乱样本（训练常用 shuffle）。",
+        "--fraction",
+        type=float,
+        required=True,
+        metavar="F",
+        help="每文件内每个整数 MU 保留比例：每 MU 取 min(条数, max(1, round(条数*F)))",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="shuffle 随机种子。",
-    )
-    parser.add_argument(
-        "--strategy",
-        choices=["mix", "concat_samples", "auto"],
-        default="mix",
-        help="mix: 样本维拼接（默认）；auto: 按 key 自动推断轴。",
+        help="抽样与 shuffle 共用种子（每文件抽样 seed = seed*1000003 + 文件序号）",
     )
     parser.add_argument(
         "--max-seq-len",
         type=int,
         default=None,
         metavar="L",
-        help="各文件截断到此长度后再合并；输出 data 宽为各文件有效 L 的最大值。",
+        help="合并前各文件 data 在时间维截断到此长度",
     )
     args = parser.parse_args()
 
-    merged, axis_by_key = merge_mat_files(
-        args.inputs,
-        args.output,
-        strategy=args.strategy,
-        max_seq_len=args.max_seq_len,
+    loaded: list[dict[str, np.ndarray]] = []
+    for fp in [Path(p).resolve() for p in args.inputs]:
+        if not fp.exists():
+            raise FileNotFoundError(f"Input file not found: {fp}")
+        with h5py.File(fp, "r") as f:
+            loaded.append({k: np.array(f[k]) for k in f.keys()})
+
+    if len(loaded) < 2:
+        raise ValueError("至少需要 2 个输入文件。")
+
+    loaded = [
+        subsample_mat_dict_per_mu(d, args.fraction, args.seed * 1_000_003 + i)
+        for i, d in enumerate(loaded)
+    ]
+    print(
+        f"\nPer-file per-MU subsample: fraction={args.fraction}, seed_base={args.seed}, "
+        f"n_files={len(loaded)}"
     )
-    merged = reorder_merged(merged, axis_by_key, args.order, args.seed)
+
+    merged, axis_by_key = merge_concat_samples(loaded, max_seq_len=args.max_seq_len)
+    merged = shuffle_merged(merged, axis_by_key, args.seed)
     save_merged(merged, args.output)
 
 

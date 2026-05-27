@@ -180,7 +180,7 @@ def main() -> None:
 
     merged, axis_by_key = mix.merge_concat_samples(loaded, max_seq_len=args.max_seq_len)
     if not args.no_shuffle:
-        merged = mix.reorder_merged(merged, axis_by_key, "shuffle", shuffle_seed)
+        merged = mix.shuffle_merged(merged, axis_by_key, shuffle_seed)
 
     out_name = args.output or _default_mat_filename(out_dir)
     if not out_name.endswith(".mat"):
