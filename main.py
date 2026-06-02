@@ -10,7 +10,7 @@ from pathlib import Path
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 import openpyxl as xl
 import matplotlib.pyplot as plt
-from model import ResNet
+from model import ResNet, CNNsimple, BiLSTM_GAMP, Transformer_CLS
 # from half_transformer2 import make_model
 from tools import (
     load_data,
@@ -37,14 +37,14 @@ n_fold = 4  # todo
 batch_size = 256  # todo
 num_workers = 0
 num_epochs = 100  # todo
-mode = 'train'  # train test test_seg visual（700：train 产出 results/res_700_70w，test 需同目录下已有权重）
-train_dataset_name = ['split_70w/700_70w_train.mat']
-val_dataset_name = ['split_70w/700_70w_val.mat']
-test_dataset_name = 'split_70w/700_70w_test.mat'
-savedir = 'res_700_70w'  # test：从 results/<savedir>/... 加载权重与 label_norm
-test_outdir = 'test_seg'  # test/test_seg：测试结果保存到 results/<test_outdir>/
+mode = 'train'  # train test test_seg visual
+train_dataset_name = ['split_70w/500_70w_train.mat']  # 500/600/700/800/900/1000/mix 换对应路径
+val_dataset_name = ['split_70w/500_70w_val.mat']
+test_dataset_name = 'split_70w/500_70w_test.mat'
+savedir = 'cmp_net/res_500_70w'  # 与档位一致：res_600_70w、res_mix_70w 等
+test_outdir = 'test_seg'  # test/test_seg：测试结果保存到 results/<savedir>/...
 
-model_select = 'ResCNN'  # fixed: only ResNet is used
+model_select = 'Transformer_CLS'  # ResCNN | CNNsimple | BiLSTM_GAMP | Transformer_CLS
 loss_type = 'MSELoss'  # todo MSELoss CrossEntropy
 use_label_norm = True  # True：仅对 MSELoss 在训练集上 fit 标准化标签，验证/测试用同一 mean/std
 test_trans_flag = 5  # todo 测试集标签最小值
@@ -680,7 +680,7 @@ def test_real_data(model, loader, model_path, test_dir_, label_norm_stats=None):
 
 
 ## load data
-Exp_name = 'ResCNN_test'  # todo 指定实验名称
+Exp_name = f'{model_select}_test'
 assert model_select in Exp_name
 root_dir = Path("./").resolve()
 save_dir = root_dir / 'results' / savedir / Exp_name
@@ -741,7 +741,16 @@ if mode == 'train':
             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True,
                                     num_workers=num_workers, pin_memory=True)
 
-        model_i = ResNet(input_size=x_dim, num_class=n_class).to(device)  # 创建模型
+        if model_select == 'ResCNN':
+            model_i = ResNet(input_size=x_dim, num_class=n_class).to(device)
+        elif model_select == 'CNNsimple':
+            model_i = CNNsimple(input_size=x_dim, num_class=n_class).to(device)
+        elif model_select == 'BiLSTM_GAMP':
+            model_i = BiLSTM_GAMP(input_size=x_dim, num_class=n_class).to(device)
+        elif model_select == 'Transformer_CLS':
+            model_i = Transformer_CLS(input_size=x_dim, num_class=n_class).to(device)
+        else:
+            raise ValueError(f'未知 model_select: {model_select}')
         if train_model is None:
             kf_dir = save_dir / f'fold{kf_i}'
             kf_dir.mkdir() if not kf_dir.exists() else None
@@ -847,7 +856,16 @@ if mode in ['test', 'test_seg']:
         epoch_test = re.search(r'_epoch(\d+)\.pth$', str(model_file_i))
         epoch_test = epoch_test.group(1)
         test_excel_i = test_dir / ('epoch_' + epoch_test + '.xlsx')
-        model_i = ResNet(input_size=x_dim, num_class=n_class).to(device)
+        if model_select == 'ResCNN':
+            model_i = ResNet(input_size=x_dim, num_class=n_class).to(device)
+        elif model_select == 'CNNsimple':
+            model_i = CNNsimple(input_size=x_dim, num_class=n_class).to(device)
+        elif model_select == 'BiLSTM_GAMP':
+            model_i = BiLSTM_GAMP(input_size=x_dim, num_class=n_class).to(device)
+        elif model_select == 'Transformer_CLS':
+            model_i = Transformer_CLS(input_size=x_dim, num_class=n_class).to(device)
+        else:
+            raise ValueError(f'未知 model_select: {model_select}')
         if mode == 'test_seg':
             # 完整长度刺激段影响测试：默认 max_len=None，会分析当前输入的完整长度。
             # 若只想比较所有维度共同的前500维，可改成 max_len=500。

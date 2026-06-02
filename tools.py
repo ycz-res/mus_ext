@@ -48,7 +48,9 @@ def load_data(file_path, model_select_, tmp_flag, loss_flag):
         is_varlen = True
         x_dim_ = int(X[0].shape[-1])
         x_len_ = max(int(x.shape[0]) for x in X)
-        if 'CNN' in model_select_:
+        if 'CNN' in model_select_ or model_select_ in (
+            'ResCNN', 'CNNsimple', 'BiLSTM_GAMP', 'Transformer_CLS',
+        ):
             X = [np.transpose(x, (1, 0)).astype(np.float32) for x in X]
         elif model_select_ == 'FCN':
             raise NotImplementedError("变长序列暂不支持 FCN，请使用 ResCNN 或固定长度 .mat")
@@ -58,15 +60,14 @@ def load_data(file_path, model_select_, tmp_flag, loss_flag):
         is_varlen = False
         x_len_ = X.shape[-2]
         x_dim_ = X.shape[-1]
-        if 'CNN' in model_select_:
+        if 'CNN' in model_select_ or model_select_ in (
+            'ResCNN', 'CNNsimple', 'BiLSTM_GAMP', 'Transformer_CLS',
+        ):
             X = X.swapaxes(1, 2)
         elif model_select_ == 'FCN':
             X = X.reshape(-1, x_dim_)
 
     Y = y1.astype(np.float32)
-
-    # 正则化
-    # X = stander(X)  # todo 正则化
 
     return X, Y, n_class_, x_len_, x_dim_, label_flag, is_varlen
 
@@ -114,7 +115,9 @@ def load_real_data(file_path, model_select_, tmp_flag, loss_flag):
         is_varlen = True
         x_dim_ = int(X[0].shape[-1])
         x_len_ = max(int(x.shape[0]) for x in X)
-        if 'CNN' in model_select_:
+        if 'CNN' in model_select_ or model_select_ in (
+            'ResCNN', 'CNNsimple', 'BiLSTM_GAMP', 'Transformer_CLS',
+        ):
             X = [np.transpose(x, (1, 0)).astype(np.float32) for x in X]
         elif model_select_ == 'FCN':
             raise NotImplementedError("变长序列暂不支持 FCN，请使用 ResCNN 或固定长度 .mat")
@@ -124,15 +127,14 @@ def load_real_data(file_path, model_select_, tmp_flag, loss_flag):
         is_varlen = False
         x_len_ = X.shape[-2]
         x_dim_ = X.shape[-1]
-        if 'CNN' in model_select_:
+        if 'CNN' in model_select_ or model_select_ in (
+            'ResCNN', 'CNNsimple', 'BiLSTM_GAMP', 'Transformer_CLS',
+        ):
             X = X.swapaxes(1, 2)
         elif model_select_ == 'FCN':
             X = X.reshape(-1, x_dim_)
 
     Y = y1.astype(np.float32)
-
-    # 正则化
-    # X = stander(X)  # todo 正则化
 
     return X, Y, n_class_, x_len_, x_dim_, label_flag, is_varlen
 
