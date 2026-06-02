@@ -9,6 +9,8 @@ data/split_70w/**
 !data/split_70w/.gitkeep
 data/data_msf/**
 !data/data_msf/.gitkeep
+data/data_msf_packed/**
+!data/data_msf_packed/.gitkeep
 data/xl_mix_sets/**
 !data/xl_mix_sets/.gitkeep
 data/__pycache__/

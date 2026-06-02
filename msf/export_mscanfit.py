@@ -20,12 +20,12 @@
 用法示例::
 
     # 整目录（输出到默认 data/data_msf）
-    python3 data/export_mscanfit.py --input-dir data/data_70w
+    python3 msf/export_mscanfit.py --input-dir data/data_70w
 
     # 指定输出目录
-    python3 data/export_mscanfit.py --input-dir data/data_70w --out-dir data_msf
+    python3 msf/export_mscanfit.py --input-dir data/data_70w --out-dir data/data_msf
 
-    python3 data/export_mscanfit.py --mat data/data_70w/500_70w.mat --out-dir /path/to/custom
+    python3 msf/export_mscanfit.py --mat data/data_70w/500_70w.mat --out-dir /path/to/custom
 
 依赖：h5py（``pip install h5py``）。
 """
@@ -39,8 +39,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-# 默认导出根目录（相对当前工作目录，一般在仓库根执行）
-DEFAULT_OUT_DIR = Path("data/data_msf")
+DEFAULT_OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "data_msf"
 
 
 def parse_args() -> argparse.Namespace:
